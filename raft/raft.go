@@ -368,7 +368,7 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 
-	if m.MsgType != pb.MessageType_MsgHup && m.MsgType != pb.MessageType_MsgBeat && m.Term < r.Term {
+	if m.Term != 0 && m.Term < r.Term { // term == 0, local message
 		return nil
 	} else if m.Term > r.Term {
 		r.Logger.Infof("%x [term: %d] received a %s message with higher term from %d [term: %d]", r.id, r.Term, m.From, m.Term)
