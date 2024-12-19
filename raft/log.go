@@ -160,3 +160,91 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return l.storage.Term(i)
 	}
 }
+
+func (l *RaftLog) slice(lo uint64, hi uint64) ([]pb.Entry, error) {
+	if lo > hi {
+		panic("lo > hi")
+	}
+
+	if lo == hi {
+		return make([]pb.Entry, 0), nil
+	}
+
+	if lo >= l.offset {
+		return l.unstableSlice(lo, hi), nil
+	}
+
+	cut := min(hi, l.offset)
+	ents, err := l.storage.Entries(lo, cut)
+	if err != nil {
+		return nil, err
+	}
+
+	if hi <= l.offset {
+		return ents, nil
+	}
+
+	return append(ents, l.unstableSlice(l.offset, hi)...), nil
+}
+
+func (l *RaftLog) unstableSlice(lo uint64, hi uint64) []pb.Entry {
+	if lo > hi {
+		panic("lo > hi")
+	}
+	if lo == hi {
+		return make([]pb.Entry, 0)
+	}
+
+	return l.entries[lo-l.offset : hi-l.offset : hi-l.offset]
+}
+
+func (l *RaftLog) append(ents ...pb.Entry) uint64 {
+	if len(ents) == 0 {
+		return l.LastIndex()
+	}
+
+	l.truncatedAndAppend(ents)
+	return l.LastIndex()
+}
+
+func (l *RaftLog) truncatedAndAppend(ents []pb.Entry) {
+	startIndex := ents[0].Index
+
+	if startIndex == l.offset+uint64(len(l.entries)) {
+		l.entries = append(l.entries, ents...)
+	} else if startIndex <= l.offset {
+		l.entries = ents
+		l.offset = startIndex
+	} else {
+		keep := l.unstableSlice(l.offset, startIndex)
+		l.entries = append(keep, ents...)
+	}
+}
+
+func (l *RaftLog) findConflict(entries []pb.Entry) uint64 {
+	for _, ent := range entries {
+		index := ent.Index
+		term, err := l.Term(index)
+		if err != nil || ent.Term != term {
+			return index
+		}
+	}
+
+	return 0
+}
+
+func (l *RaftLog) maybeAppend(prevIndex, prevTerm, leaderCommit uint64, entries []pb.Entry) (uint64, bool) {
+	term, err := l.Term(prevIndex)
+	if err != nil || term != prevTerm {
+		return 0, false
+	}
+
+	ci := l.findConflict(entries)
+	start := prevIndex + 1
+	l.truncatedAndAppend(entries[ci-start:])
+
+	lastIndex := prevIndex + uint64(len(entries))
+
+	l.committed = min(leaderCommit, lastIndex)
+	return lastIndex, true
+}

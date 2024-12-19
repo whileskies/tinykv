@@ -232,6 +232,21 @@ func (r *Raft) reset(term uint64) {
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
 	r.resetRandomElectionTimeout()
+
+	r.resetPrs()
+}
+
+func (r *Raft) resetPrs() {
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range r.peers {
+		r.Prs[id] = &Progress{
+			Next:  r.RaftLog.LastIndex() + 1,
+			Match: 0,
+		}
+		if id == r.id {
+			r.Prs[id].Match = r.RaftLog.LastIndex()
+		}
+	}
 }
 
 func (r *Raft) resetVotes() {
@@ -242,11 +257,48 @@ func (r *Raft) resetRandomElectionTimeout() {
 	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
+func (r *Raft) sendAppendEntriesBroadcast() {
+	for _, id := range r.peers {
+		if id != r.id {
+			r.sendAppend(id)
+		}
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr := r.Prs[to]
+
+	prevIndex := pr.Next - 1
+	prevTerm, err := r.RaftLog.Term(prevIndex)
+	if err != nil {
+		return false
+	}
+
+	var ents []*pb.Entry
+	entris, err := r.RaftLog.slice(pr.Next, r.RaftLog.LastIndex())
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entris {
+		ents = append(ents, &entry)
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   prevIndex,
+		LogTerm: prevTerm,
+		Entries: ents,
+		Commit:  r.RaftLog.committed,
+	})
+
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -473,20 +525,41 @@ func (r *Raft) candidateCanBeLeader() bool {
 // Leader handle messages
 func (r *Raft) leaderStep(m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgAppend:
-		assert(m.Term != r.Term)
-		// append
+	// case pb.MessageType_MsgAppend:
+	// 	assert(m.Term != r.Term)
+	// 	// append
 
 	case pb.MessageType_MsgBeat:
-		return r.leaderHandleBeat(m)
+		r.leaderHandleBeat(m)
+		return nil
+	case pb.MessageType_MsgPropose:
+		r.leaderHandleMsgPropose(m)
+		return nil
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendEntriesResponse(m)
+		return nil
 	}
 
 	return nil
 }
 
-func (r *Raft) leaderHandleBeat(m pb.Message) error {
+func (r *Raft) leaderHandleBeat(m pb.Message) {
 	r.sendHeartbeatBroadcast()
-	return nil
+}
+
+func (r *Raft) leaderHandleMsgPropose(m pb.Message) {
+	lastIndex := r.RaftLog.LastIndex()
+	entries := make([]pb.Entry, len(m.Entries))
+
+	for i, e := range m.Entries {
+		entries[i] = *e
+		entries[i].Term = r.Term
+		entries[i].Index = lastIndex + 1 + uint64(i)
+	}
+
+	r.RaftLog.append(entries...)
+
+	r.sendAppendEntriesBroadcast()
 }
 
 func (r *Raft) handleMsgHup(m pb.Message) {
@@ -503,6 +576,84 @@ func (r *Raft) handleMsgHup(m pb.Message) {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	// r.resetRandomElectionTimeout()
+
+	prevIndex := m.Index
+	prevTerm := m.LogTerm
+	var ents []pb.Entry
+
+	for _, ent := range m.Entries {
+		ents = append(ents, *ent)
+	}
+
+	if prevIndex < r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			To:      m.From,
+			From:    r.id,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   r.RaftLog.committed, // to update match
+		})
+		return
+	}
+
+	if lastMatch, ok := r.RaftLog.maybeAppend(prevIndex, prevTerm, m.Commit, ents); ok {
+		r.msgs = append(r.msgs, pb.Message{
+			To:      m.From,
+			From:    r.id,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   lastMatch,
+		})
+		return
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		To:      m.From,
+		From:    r.id,
+		MsgType: pb.MessageType_MsgAppendResponse,
+		Reject:  true,
+	})
+}
+
+func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
+	peerId := m.From
+
+	if !m.Reject {
+		r.Prs[peerId].Match = m.Index
+		r.Prs[peerId].Next = r.Prs[peerId].Match + 1
+		if index, ok := r.maybeUpdateCommit(); ok {
+			r.RaftLog.committed = max(r.RaftLog.committed, index)
+		}
+	} else {
+		r.Prs[peerId].Next -= 1
+	}
+}
+
+func (r *Raft) maybeUpdateCommit() (uint64, bool) {
+	for index := r.RaftLog.LastIndex(); index > r.RaftLog.committed; index-- {
+		term, err := r.RaftLog.Term(index)
+		if err != nil {
+			panic(err)
+		}
+		if term != r.Term {
+			return 0, false
+		}
+
+		majorCnt := 1
+		for _, pid := range r.peers {
+			if pid == r.id {
+				continue
+			}
+
+			if r.Prs[pid].Match >= index {
+				majorCnt += 1
+			}
+		}
+
+		if majorCnt > len(r.peers)/2 {
+			return index, true
+		}
+	}
+
+	return 0, false
 }
 
 // handleHeartbeat handle Heartbeat RPC request
